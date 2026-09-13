@@ -1,0 +1,5 @@
+# install.sh is fetched and hashed before being run, and the control plane publishes the
+# expected digest. A CRLF checkout would change that digest and break on Linux, so pin LF.
+* text=auto eol=lf
+*.sh text eol=lf
+*.pem text eol=lf
