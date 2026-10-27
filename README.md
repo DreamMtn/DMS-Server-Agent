@@ -11,14 +11,21 @@ purpose: see [Why this is public](#why-this-is-public).
 
 ## Installing on a host
 
-You will be given an **enrollment token** (valid one hour, single use) and the **release
-public key** by Dream Mountain.
+Dream Mountain gives you the full command from the host's **enrollment dialog**. It
+contains a one-time **enrollment token** (valid one hour), plus the exact agent release to
+install and that release's SHA-256 digest:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/keys/release_key.pub.pem \
+  -o /tmp/release_key.pub.pem
 curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/install.sh \
   | sudo bash -s -- --url https://hosting-api.dreammtn.com --token <enrollment token> \
-                    --zfs-parent tank/dms --release-key /path/to/release_key.pub.pem
+                    --zfs-parent tank/dms --release-key /tmp/release_key.pub.pem \
+                    --version <version> --sha256 <digest>
 ```
+
+The installer has no "latest". It installs exactly the version it is given, and stops if
+the download does not match the digest.
 
 ### Verify before running it (recommended for production)
 
@@ -30,8 +37,15 @@ enrollment dialog in the control plane, which is authenticated — this reposito
 curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/install.sh \
   -o /tmp/dms-install.sh
 sha256sum /tmp/dms-install.sh          # compare with the enrollment dialog
-sudo bash /tmp/dms-install.sh --url ... --token ... --release-key ...
+curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/keys/release_key.pub.pem \
+  -o /tmp/release_key.pub.pem
+openssl pkey -pubin -in /tmp/release_key.pub.pem -outform DER | sha256sum   # key fingerprint
+sudo bash /tmp/dms-install.sh --url ... --token ... --release-key /tmp/release_key.pub.pem \
+                              --version ... --sha256 ...
 ```
+
+Compare the key fingerprint with the one in the enrollment dialog, not with anything on
+this page: this repository is the thing being checked.
 
 If the two do not match, **stop** and contact us.
 
@@ -45,7 +59,8 @@ If the two do not match, **stop** and contact us.
 | `--no-zfs` | Host has no ZFS pool. Production environments refuse to provision without it, because there would be no snapshot to roll back to. |
 | `--release-key` | PEM file with the agent release public key. **Without it the host cannot be upgraded remotely.** |
 | `--allow-destructive` | Permit rollback, restore, prune and remove jobs. Intended for stage hosts; leave off on production. |
-| `--version` | Install a specific version instead of the latest. |
+| `--version` | **Required.** The agent release to install, as given in the enrollment dialog. |
+| `--sha256` | Expected SHA-256 of the agent archive, from the enrollment dialog. The install stops if the download differs. |
 | `--skip-enroll` | Install and configure without contacting the control plane. |
 
 The installer needs Ubuntu or Debian and installs Docker, restic, and a Python virtualenv.
