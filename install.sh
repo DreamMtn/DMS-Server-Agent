@@ -35,6 +35,7 @@ ZFS_PARENT="tank/dms"
 WITH_ZFS=1
 ALLOW_DESTRUCTIVE=0
 SKIP_ENROLL=0
+WITH_CROWDSEC=1
 RELEASE_KEY_FILE=""
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -61,6 +62,9 @@ Options:
   --sha256 DIGEST        Expected SHA-256 of the agent archive, from the control plane.
                          The install stops if the download does not match.
   --skip-enroll          Install and configure, but do not contact the control plane.
+  --no-crowdsec          Do not install CrowdSec (intrusion detection + firewall bouncer).
+                         It is installed in detect-only mode; the control plane applies
+                         the rules and the mode chosen for this server.
 USAGE
 }
 
@@ -75,6 +79,7 @@ while [ $# -gt 0 ]; do
     --version) AGENT_VERSION="${2:?--version needs a value}"; shift 2 ;;
     --sha256) ARTIFACT_SHA256="${2:?--sha256 needs a value}"; shift 2 ;;
     --skip-enroll) SKIP_ENROLL=1; shift ;;
+    --no-crowdsec) WITH_CROWDSEC=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown option $1" ;;
   esac
@@ -108,12 +113,32 @@ esac
 info "Installing prerequisites"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-PACKAGES="docker.io docker-compose-v2 python3-venv python3-pip git curl ca-certificates restic"
+PACKAGES="docker.io docker-compose-v2 python3-venv python3-pip git curl ca-certificates gnupg restic"
 if [ "$WITH_ZFS" -eq 1 ]; then
   PACKAGES="$PACKAGES zfsutils-linux"
 fi
 # shellcheck disable=SC2086
 apt-get install -y -qq $PACKAGES
+
+if [ "$WITH_CROWDSEC" -eq 1 ]; then
+  # The official repository, added explicitly rather than by piping their setup script
+  # into a root shell. The agent owns the configuration (agent/dms_agent/crowdsec.py).
+  info "Installing CrowdSec (detect-only until the control plane applies a mode)"
+  install -d -m 755 /etc/apt/keyrings
+  curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey | gpg --dearmor --yes -o /etc/apt/keyrings/crowdsec.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/crowdsec.gpg] https://packagecloud.io/crowdsec/crowdsec/any any main" > /etc/apt/sources.list.d/crowdsec.list
+  apt-get update -qq
+  apt-get install -y -qq crowdsec
+  # A fresh CrowdSec bans with its default rules at once. Detect only until someone has
+  # looked at what it would ban (the same rule as on the Cloudpepper servers).
+  cscli simulation enable --global >/dev/null
+  if iptables --version 2>/dev/null | grep -q legacy; then
+    apt-get install -y -qq crowdsec-firewall-bouncer-iptables
+  else
+    apt-get install -y -qq crowdsec-firewall-bouncer-nftables
+  fi
+  systemctl reload-or-restart crowdsec
+fi
 systemctl enable --now docker >/dev/null 2>&1 || true
 
 if [ "$WITH_ZFS" -eq 1 ] && ! zfs list -H -o name "$ZFS_PARENT" >/dev/null 2>&1; then

@@ -62,8 +62,9 @@ If the two do not match, **stop** and contact us.
 | `--version` | **Required.** The agent release to install, as given in the enrollment dialog. |
 | `--sha256` | Expected SHA-256 of the agent archive, from the enrollment dialog. The install stops if the download differs. |
 | `--skip-enroll` | Install and configure without contacting the control plane. |
+| `--no-crowdsec` | Do not install CrowdSec. By default it is installed in detect-only mode, and the control plane applies the rules and the mode chosen for the server. |
 
-The installer needs Ubuntu or Debian and installs Docker, restic, and a Python virtualenv.
+The installer needs Ubuntu or Debian and installs Docker, restic, CrowdSec (detect-only) and a Python virtualenv.
 Re-running it is safe: existing credentials and host-side switches are kept.
 
 ### The ZFS pool is yours to create
