@@ -17,6 +17,7 @@
 #   3. writes /etc/dms-agent/config.json, including the release public key
 #   4. enrolls with the control plane using the one-time token
 #   5. installs and starts the systemd unit
+#   (optional) installs cloudflared as an outbound-only tunnel when --tunnel-credentials-file is given
 #
 # Re-running it is safe: an existing config keeps its credentials and host-side switches.
 set -euo pipefail
@@ -37,6 +38,14 @@ ALLOW_DESTRUCTIVE=0
 SKIP_ENROLL=0
 WITH_CROWDSEC=1
 RELEASE_KEY_FILE=""
+TUNNEL_CREDENTIALS_FILE=""
+TUNNEL_ID=""
+TUNNEL_ACTION=""
+TUNNEL_DIR=/etc/dms-tunnel
+TUNNEL_METRICS_PORT=20241
+TUNNEL_CREDENTIALS="${TUNNEL_DIR}/credentials.json"
+TUNNEL_CONFIG="${TUNNEL_DIR}/tunnel.yml"
+TUNNEL_SERVICE_FILE=/etc/systemd/system/dms-tunnel.service
 
 die() { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -65,6 +74,19 @@ Options:
   --no-crowdsec          Do not install CrowdSec (intrusion detection + firewall bouncer).
                          It is installed in detect-only mode; the control plane applies
                          the rules and the mode chosen for this server.
+  --tunnel-credentials-file FILE
+                         Credentials of a Cloudflare Tunnel made with
+                         scripts/create_tunnel.py. Installs cloudflared as the dms-tunnel
+                         service, with its routing rules in a file on this host. A new host
+                         takes its traffic through the tunnel from the start. The file is
+                         copied to a root-only location; delete FILE afterwards.
+
+Moving a host that is already running (none of these need --url, --token or --version):
+  --tunnel-only --tunnel-credentials-file FILE
+                         Install the tunnel service only. Traffic does not move yet.
+  --tunnel-cutover       Send this host's web traffic through the tunnel: nginx closes its
+                         public ports, and the control plane moves the DNS records.
+  --tunnel-revert        Undo --tunnel-cutover: public ports and DNS records come back.
 USAGE
 }
 
@@ -80,12 +102,207 @@ while [ $# -gt 0 ]; do
     --sha256) ARTIFACT_SHA256="${2:?--sha256 needs a value}"; shift 2 ;;
     --skip-enroll) SKIP_ENROLL=1; shift ;;
     --no-crowdsec) WITH_CROWDSEC=0; shift ;;
+    --tunnel-credentials-file) TUNNEL_CREDENTIALS_FILE="${2:?--tunnel-credentials-file needs a value}"; shift 2 ;;
+    --tunnel-only) TUNNEL_ACTION=install; shift ;;
+    --tunnel-cutover) TUNNEL_ACTION=cutover; shift ;;
+    --tunnel-revert) TUNNEL_ACTION=revert; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown option $1" ;;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || die "run this as root (sudo)."
+
+# ---------------------------------------------------------------- tunnel
+# Read the credentials once, before anything changes, so a bad file stops the install here.
+read_tunnel_credentials() {
+  [ -f "$TUNNEL_CREDENTIALS_FILE" ] || die "tunnel credentials file not found: $TUNNEL_CREDENTIALS_FILE"
+  # cert.pem is what `cloudflared tunnel login` leaves behind. It controls the whole Cloudflare
+  # account, so it must never reach a customer server.
+  if grep -q 'BEGIN ' "$TUNNEL_CREDENTIALS_FILE"; then
+    die "$TUNNEL_CREDENTIALS_FILE looks like an account certificate. Use the tunnel's credentials file."
+  fi
+  grep -q '"AccountTag"' "$TUNNEL_CREDENTIALS_FILE" && grep -q '"TunnelSecret"' "$TUNNEL_CREDENTIALS_FILE" \
+    || die "$TUNNEL_CREDENTIALS_FILE is not a tunnel credentials file"
+  TUNNEL_ID="$(sed -n 's/.*"TunnelID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TUNNEL_CREDENTIALS_FILE")"
+  [[ "$TUNNEL_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || die "$TUNNEL_CREDENTIALS_FILE has no valid TunnelID"
+}
+
+# Host-side, like allow_destructive: the control plane reads these and cannot set them.
+# Second argument: 1 or 0 to switch traffic, empty to leave the switch alone.
+write_tunnel_settings() {
+  python3 - "$CONFIG_FILE" "$1" "$2" <<'PYEOF'
+import json, os, sys
+
+path, tunnel_id, enabled = sys.argv[1:4]
+with open(path) as handle:
+    config = json.load(handle)
+if tunnel_id:
+    config['tunnel_id'] = tunnel_id
+if enabled:
+    config['tunnel_enabled'] = enabled == '1'
+fd = os.open(path + '.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, 'w') as handle:
+    json.dump(config, handle, indent=2)
+os.replace(path + '.tmp', path)
+PYEOF
+}
+
+tunnel_connected() {
+  curl -fsS -m 3 -o /dev/null "http://127.0.0.1:${TUNNEL_METRICS_PORT}/ready" 2>/dev/null
+}
+
+install_tunnel() {
+  # Cloudflare's signed package repository, added explicitly like CrowdSec's.
+  info "Installing cloudflared (outbound-only tunnel)"
+  install -d -m 755 /usr/share/keyrings
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg
+  chmod 644 /usr/share/keyrings/cloudflare-main.gpg
+  printf '%s\n' 'Types: deb' 'URIs: https://pkg.cloudflare.com/cloudflared' 'Suites: any' \
+    'Components: main' 'Signed-By: /usr/share/keyrings/cloudflare-main.gpg' \
+    > /etc/apt/sources.list.d/cloudflared.sources
+  apt-get update -qq
+  apt-get install -y -qq cloudflared unattended-upgrades
+
+  # unattended-upgrades only follows the distribution unless told otherwise.
+  printf 'Unattended-Upgrade::Origins-Pattern { "origin=cloudflared"; };\n' \
+    > /etc/apt/apt.conf.d/52dms-cloudflared
+
+  # Its own user and directory: /etc/dms-agent holds the agent token and stays root-only. The
+  # service can read these files and cannot change them, so it cannot rewrite its own rules.
+  id dms-tunnel >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin dms-tunnel
+  install -d -m 750 -o root -g dms-tunnel "$TUNNEL_DIR"
+  install -m 640 -o root -g dms-tunnel "$TUNNEL_CREDENTIALS_FILE" "${TUNNEL_CREDENTIALS}.tmp"
+  mv -f "${TUNNEL_CREDENTIALS}.tmp" "$TUNNEL_CREDENTIALS"
+
+  # The routing rules live here, not in the Cloudflare account, so nobody with access to the
+  # account can point this host's tunnel at anything else. Everything goes to nginx. HTTP is
+  # right: it stays on loopback, and cloudflared has already ended the encrypted connection.
+  cat > "${TUNNEL_CONFIG}.tmp" <<YAML
+tunnel: ${TUNNEL_ID}
+credentials-file: ${TUNNEL_CREDENTIALS}
+ingress:
+  - service: http://127.0.0.1:80
+YAML
+  chown root:dms-tunnel "${TUNNEL_CONFIG}.tmp"
+  chmod 640 "${TUNNEL_CONFIG}.tmp"
+  mv -f "${TUNNEL_CONFIG}.tmp" "$TUNNEL_CONFIG"
+
+  # A private network route added in the Cloudflare account would bypass the rules above, so
+  # the service cannot reach private addresses at all. DNS servers on the LAN are the exception.
+  local dns_allow
+  dns_allow="$(awk '$1 == "nameserver" && $2 ~ /^[0-9a-fA-F:.]+$/ { printf "%s ", $2 }' /etc/resolv.conf)"
+
+  cat > "$TUNNEL_SERVICE_FILE" <<UNIT
+[Unit]
+Description=DMS tunnel (cloudflared, outbound-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Updates come from apt, so the binary does not replace itself.
+# /ready on the metrics port answers 200 only while connected to Cloudflare. The service can
+# stay "active" for ever with a rejected credential, so nothing else proves it works.
+ExecStart=/usr/bin/cloudflared --no-autoupdate --metrics 127.0.0.1:${TUNNEL_METRICS_PORT} --config ${TUNNEL_CONFIG} tunnel run
+Restart=on-failure
+RestartSec=5
+User=dms-tunnel
+Group=dms-tunnel
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10
+IPAddressAllow=${dns_allow}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  # An apt update replaces the binary but leaves the old one running.
+  cat > /etc/systemd/system/dms-tunnel-update.path <<'UNIT'
+[Unit]
+Description=Restart the DMS tunnel when cloudflared is updated
+
+[Path]
+PathChanged=/usr/bin/cloudflared
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  cat > /etc/systemd/system/dms-tunnel-update.service <<'UNIT'
+[Unit]
+Description=Restart the DMS tunnel after a cloudflared update
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart dms-tunnel
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable --now dms-tunnel-update.path >/dev/null 2>&1
+  systemctl enable dms-tunnel >/dev/null 2>&1
+  systemctl restart dms-tunnel
+  for _ in $(seq 1 20); do
+    if tunnel_connected; then
+      info "dms-tunnel is connected to Cloudflare (tunnel ${TUNNEL_ID})."
+      echo "note: delete ${TUNNEL_CREDENTIALS_FILE} now; the credentials are kept in ${TUNNEL_CREDENTIALS}." >&2
+      return 0
+    fi
+    sleep 3
+  done
+  echo "warning: dms-tunnel did not connect to Cloudflare within a minute. Recent log:" >&2
+  journalctl -u dms-tunnel -n 20 --no-pager >&2 || true
+  return 1
+}
+
+agent_python() {
+  "${INSTALL_ROOT}/current/venv/bin/python" -m dms_agent --config "$CONFIG_FILE" "$@"
+}
+
+# Apply the switch to nginx now, and restart the agent so it reports it. The control plane then
+# moves the DNS records and rewrites the sites.
+switch_tunnel() {
+  write_tunnel_settings "" "$1"
+  if ! agent_python nginx-sync; then
+    write_tunnel_settings "" "$((1 - $1))"
+    agent_python nginx-sync || true
+    die "nginx could not be switched, so nothing changed. The agent must be 0.16.0 or later."
+  fi
+  systemctl restart dms-agent
+}
+
+if [ -n "$TUNNEL_ACTION" ]; then
+  [ -f "$CONFIG_FILE" ] || die "${CONFIG_FILE} not found. Install the agent first."
+  case "$TUNNEL_ACTION" in
+    install)
+      [ -n "$TUNNEL_CREDENTIALS_FILE" ] || die "--tunnel-only needs --tunnel-credentials-file"
+      read_tunnel_credentials
+      export DEBIAN_FRONTEND=noninteractive
+      write_tunnel_settings "$TUNNEL_ID" ""
+      install_tunnel || die "the tunnel is installed but not connected. Traffic has not moved."
+      systemctl restart dms-agent
+      info "Installed. Traffic has not moved. Test it, then run this again with --tunnel-cutover."
+      ;;
+    cutover)
+      # Closing the public ports with no working tunnel would take every site down.
+      python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("tunnel_id") else 1)' "$CONFIG_FILE" \
+        || die "no tunnel is installed here. Run --tunnel-only first."
+      tunnel_connected || die "dms-tunnel is not connected to Cloudflare, so nothing changed. Check: journalctl -u dms-tunnel"
+      switch_tunnel 1
+      info "nginx now takes traffic from the tunnel only. The control plane moves DNS within a few minutes."
+      ;;
+    revert)
+      switch_tunnel 0
+      info "nginx has its public ports back. The control plane moves DNS within a few minutes."
+      ;;
+  esac
+  exit 0
+fi
+
 [ -n "$CONTROL_URL" ] || { usage >&2; die "--url is required"; }
 if [ "$SKIP_ENROLL" -eq 0 ] && [ -z "$ENROLL_TOKEN" ]; then
   usage >&2; die "--token is required (or pass --skip-enroll)"
@@ -99,6 +316,9 @@ esac
 [ -n "$AGENT_VERSION" ] || die "--version is required. Copy the command from the host's enrollment dialog, which names the current release."
 echo "$AGENT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.-]+)?$' \
   || die "invalid --version: $AGENT_VERSION"
+if [ -n "$TUNNEL_CREDENTIALS_FILE" ]; then
+  read_tunnel_credentials
+fi
 if [ -n "$ARTIFACT_SHA256" ]; then
   echo "$ARTIFACT_SHA256" | grep -Eq '^[0-9a-f]{64}$' || die "invalid --sha256: $ARTIFACT_SHA256"
 fi
@@ -140,6 +360,10 @@ if [ "$WITH_CROWDSEC" -eq 1 ]; then
   systemctl reload-or-restart crowdsec
 fi
 systemctl enable --now docker >/dev/null 2>&1 || true
+
+if [ -n "$TUNNEL_CREDENTIALS_FILE" ]; then
+  install_tunnel || echo "warning: continuing; the server form shows when the tunnel comes up." >&2
+fi
 
 if [ "$WITH_ZFS" -eq 1 ] && ! zfs list -H -o name "$ZFS_PARENT" >/dev/null 2>&1; then
   cat >&2 <<EOF
@@ -254,6 +478,17 @@ with os.fdopen(fd, 'w') as handle:
 os.replace(path + '.tmp', path)
 print('wrote ' + path)
 PYEOF
+
+if [ -n "$TUNNEL_CREDENTIALS_FILE" ]; then
+  # A new host starts on the tunnel. One already enrolled may be serving people, so moving it
+  # stays a separate step.
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("agent_token") else 1)' "$CONFIG_FILE"; then
+    write_tunnel_settings "$TUNNEL_ID" ""
+    info "This host is already enrolled, so traffic has not moved. Use --tunnel-cutover when ready."
+  else
+    write_tunnel_settings "$TUNNEL_ID" 1
+  fi
+fi
 
 mkdir -p /var/lib/dms-agent /srv/dms/envs /srv/dms/code
 chmod 700 /var/lib/dms-agent
