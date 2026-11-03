@@ -18,6 +18,7 @@
 #   4. enrolls with the control plane using the one-time token
 #   5. installs and starts the systemd unit
 #   (optional) installs cloudflared as an outbound-only tunnel when --tunnel-credentials-file is given
+#   (optional) sets up the ZFS pool, asking which disk, when --setup-zfs is given
 #
 # Re-running it is safe: an existing config keeps its credentials and host-side switches.
 set -euo pipefail
@@ -34,6 +35,10 @@ CONTROL_URL=""
 ENROLL_TOKEN=""
 ZFS_PARENT="tank/dms"
 WITH_ZFS=1
+SETUP_ZFS=0
+ZFS_PARENT_GIVEN=0
+# Only the tests set this: a folder standing in for /dev, /sys, /proc and /etc in the ZFS setup.
+ZFS_TEST_ROOT="${DMS_ZFS_TEST_ROOT:-}"
 ALLOW_DESTRUCTIVE=0
 SKIP_ENROLL=0
 WITH_CROWDSEC=1
@@ -60,6 +65,9 @@ Required:
 
 Options:
   --zfs-parent DATASET   ZFS parent dataset for environments (default: tank/dms)
+  --setup-zfs            Create the ZFS pool as part of this install, asking which disk to
+                         use. Without --url it does only that, on a server already installed.
+                         Safe to repeat: a server that has the pool is left as it is.
   --no-zfs               Host has no ZFS pool. Production environments will refuse to
                          provision, because there would be no snapshot to roll back to.
   --allow-destructive    Permit rollback / restore / prune jobs on this host.
@@ -94,7 +102,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --url) CONTROL_URL="${2:?--url needs a value}"; shift 2 ;;
     --token) ENROLL_TOKEN="${2:?--token needs a value}"; shift 2 ;;
-    --zfs-parent) ZFS_PARENT="${2:?--zfs-parent needs a value}"; shift 2 ;;
+    --zfs-parent) ZFS_PARENT="${2:?--zfs-parent needs a value}"; ZFS_PARENT_GIVEN=1; shift 2 ;;
+    --setup-zfs) SETUP_ZFS=1; shift ;;
     --no-zfs) WITH_ZFS=0; shift ;;
     --allow-destructive) ALLOW_DESTRUCTIVE=1; shift ;;
     --release-key) RELEASE_KEY_FILE="${2:?--release-key needs a value}"; shift 2 ;;
@@ -275,6 +284,268 @@ switch_tunnel() {
   systemctl restart dms-agent
 }
 
+# ---------------------------------------------------------------- ZFS pool
+# Guided, because creating a pool erases a disk and which disk is right differs on every
+# server. The rules that keep it from the wrong disk: a server that has the pool is never
+# changed, only whole empty disks are offered, nothing is chosen for you, a typed confirmation
+# names what is erased, and `zpool create` is never forced, so ZFS's own check still applies.
+# Runs in a subshell under `||`, where set -e does nothing: every step checks for itself.
+
+# One line per disk, tab separated: ok|no, name, size, model, stable path or the refusal.
+zfs_disks() {
+  local json
+  json="$(lsblk -J -b -o NAME,TYPE,SIZE,MODEL,FSTYPE,MOUNTPOINT,RO,RM)" || die "could not list the disks (lsblk)."
+  python3 - "$json" "$ZFS_TEST_ROOT" <<'PYEOF'
+import json
+import os
+import subprocess
+import sys
+
+root = sys.argv[2]
+ZERO_CHECK_BYTES = 1 << 20
+
+
+def stable_path(name):
+    folder = root + '/dev/disk/by-id'
+    try:
+        entries = sorted(os.listdir(folder))
+    except OSError:
+        return ''
+    found = [entry for entry in entries if '-part' not in entry
+             and os.path.basename(os.path.realpath(os.path.join(folder, entry))) == name]
+    found.sort(key=lambda entry: entry.startswith('wwn-'))
+    return '/dev/disk/by-id/' + found[0] if found else ''
+
+
+def has_holders(name):
+    return bool(os.listdir(f'{root}/sys/block/{name}/holders'))
+
+
+def starts_with_zeros(name):
+    with open(f'{root}/dev/{name}', 'rb') as disk:
+        block = disk.read(ZERO_CHECK_BYTES)
+    return bool(block) and block.count(0) == len(block)
+
+
+def refusal(disk):
+    """Why this disk is not offered, or '' if it looks new. A check that cannot run refuses."""
+    name = disk['name']
+    if disk.get('fstype') == 'zfs_member':
+        return 'holds a ZFS pool; to reuse it, run: zpool import'
+    if disk.get('ro') in (True, 1, '1'):
+        return 'read-only'
+    if disk.get('rm') in (True, 1, '1'):
+        return 'removable'
+    if disk.get('children'):
+        return 'has partitions or volumes'
+    if disk.get('fstype'):
+        return f'holds a filesystem ({disk["fstype"]})'
+    if disk.get('mountpoint'):
+        return f'mounted at {disk["mountpoint"]}'
+    try:
+        if has_holders(name):
+            return 'in use by another device (LVM, RAID or similar)'
+        probe = subprocess.run(['blkid', '-p', f'/dev/{name}'], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if probe.returncode == 0:
+            return 'holds a filesystem or partition table: ' + probe.stdout.strip()
+        if probe.returncode != 2:     # 2 is how blkid says it found nothing
+            return 'could not be checked (blkid)'
+        if not starts_with_zeros(name):
+            return 'not blank: the start of the disk has data on it'
+    except OSError as exc:
+        return f'could not be checked ({exc.strerror})'
+    if not stable_path(name):
+        return 'has no stable name in /dev/disk/by-id'
+    return ''
+
+
+for disk in json.loads(sys.argv[1])['blockdevices']:
+    if disk.get('type') != 'disk':
+        continue
+    reason = refusal(disk)
+    size = f"{int(disk.get('size') or 0) / 2**30:.1f} GiB"
+    model = ' '.join((disk.get('model') or '-').split())
+    print('\t'.join(['no' if reason else 'ok', disk['name'], size, model,
+                     reason or stable_path(disk['name'])]))
+PYEOF
+}
+
+zfs_ask() {
+  ZFS_ANSWER=""
+  printf '%s' "$1"
+  read -r ZFS_ANSWER <&3 || ZFS_ANSWER=""
+  ZFS_ANSWER="${ZFS_ANSWER//$'\r'/}"
+}
+
+# Returns 1 when the person stopped, with nothing changed.
+zfs_create_pool() {
+  local pool="$1" list status name size model detail answer disk confirm
+  local -a offered=() chosen=() paths=() vdev=()
+  list="$(zfs_disks)" || die "could not check the disks, so nothing changed."
+
+  echo
+  echo "Disks on this server:"
+  while IFS=$'\t' read -r status name size model detail; do
+    [ -n "$name" ] || continue
+    if [ "$status" = ok ]; then
+      offered+=("$name")
+      printf '  %-10s %-12s %-24s empty: %s\n' "$name" "$size" "$model" "$detail"
+    else
+      printf '  %-10s %-12s %-24s not offered: %s\n' "$name" "$size" "$model" "$detail"
+    fi
+  done <<<"$list"
+  echo
+
+  if [ "${#offered[@]}" -eq 0 ]; then
+    die "no empty disk to use, so nothing changed. Add a second disk first (docs/ZFS_SETUP.md); on DigitalOcean choose Manually Format & Mount, because the automatic option formats it."
+  fi
+  if [ "${#offered[@]}" -eq 1 ]; then
+    zfs_ask "Type the name of the disk for pool ${pool} (${offered[0]}), or press Enter to stop: "
+  else
+    zfs_ask "Type the name of the disk for pool ${pool}, two names for a mirror, or press Enter to stop: "
+  fi
+  read -ra chosen <<<"$ZFS_ANSWER"
+  [ "${#chosen[@]}" -gt 0 ] || return 1
+  [ "${#chosen[@]}" -le 2 ] || die "at most two disks, so nothing changed."
+  if [ "${#chosen[@]}" -eq 2 ] && [ "${chosen[0]}" = "${chosen[1]}" ]; then
+    die "a mirror needs two different disks, so nothing changed."
+  fi
+
+  echo
+  echo "This ERASES:"
+  for answer in "${chosen[@]}"; do
+    disk=""
+    while IFS=$'\t' read -r status name size model detail; do
+      if [ "$status" = ok ] && [ "$name" = "$answer" ]; then
+        disk="$detail"
+        printf '  %-10s %-12s %-24s %s\n' "$name" "$size" "$model" "$detail"
+      fi
+    done <<<"$list"
+    [ -n "$disk" ] || die "\"$answer\" is not one of the disks offered, so nothing changed."
+    paths+=("$disk")
+  done
+  if [ "${#paths[@]}" -eq 2 ]; then
+    vdev=(mirror)
+  fi
+  vdev+=("${paths[@]}")
+  echo
+  confirm="create ${pool}"
+  zfs_ask "Type \"${confirm}\" to go ahead, anything else stops: "
+  [ "$ZFS_ANSWER" = "$confirm" ] || return 1
+
+  # Look again: the disk may have changed while the question was on the screen.
+  list="$(zfs_disks)" || die "could not check the disks, so nothing changed."
+  for answer in "${chosen[@]}"; do
+    awk -F'\t' -v disk="$answer" '$1 == "ok" && $2 == disk { found = 1 } END { exit !found }' <<<"$list" \
+      || die "$answer is no longer empty, so nothing changed."
+  done
+
+  info "Creating pool ${pool}"
+  # Never -f: that is the switch that would overrule ZFS finding something on the disk.
+  zpool create -m none -o ashift=12 -O compression=lz4 -O atime=off "$pool" "${vdev[@]}" \
+    || die "zpool refused, so the pool was not created. Its message is above."
+  zpool set autoexpand=on "$pool" || echo "warning: could not set autoexpand on ${pool}." >&2
+}
+
+# The cap's size comes from docs/ZFS_SETUP.md. An existing cap is somebody's decision.
+zfs_cap_memory() {
+  local conf="${ZFS_TEST_ROOT}/etc/modprobe.d/zfs.conf" total_kb suggested mib bytes
+  if grep -qs zfs_arc_max "$conf"; then
+    info "ZFS memory cache cap is already set in ${conf#"$ZFS_TEST_ROOT"}."
+    return 0
+  fi
+  total_kb="$(awk '/^MemTotal:/ { print $2 }' "${ZFS_TEST_ROOT}/proc/meminfo")"
+  if ! [[ "$total_kb" =~ ^[0-9]+$ ]]; then
+    echo "warning: could not read the memory size; ZFS memory cache not capped." >&2
+    return 0
+  fi
+  if [ "$total_kb" -le $((8 * 1024 * 1024)) ]; then suggested=512
+  elif [ "$total_kb" -le $((16 * 1024 * 1024)) ]; then suggested=1024
+  elif [ "$total_kb" -le $((32 * 1024 * 1024)) ]; then suggested=2048
+  else suggested=4096
+  fi
+  echo
+  zfs_ask "Cap the ZFS memory cache at ${suggested} MiB? Enter accepts, or type another size in MiB, or \"skip\": "
+  mib="${ZFS_ANSWER:-$suggested}"
+  if [ "$mib" = skip ]; then
+    echo "ZFS memory cache not capped: it can use up to half the RAM."
+    return 0
+  fi
+  if ! [[ "$mib" =~ ^[0-9]+$ ]] || [ "${#mib}" -gt 7 ] || [ "$mib" -lt 64 ]; then
+    echo "warning: \"$mib\" is not a size of at least 64 MiB; ZFS memory cache not capped." >&2
+    return 0
+  fi
+  bytes=$((mib * 1024 * 1024))
+  if ! { mkdir -p "$(dirname "$conf")" && echo "options zfs zfs_arc_max=${bytes}" >>"$conf"; }; then
+    echo "warning: could not write ${conf}; ZFS memory cache not capped." >&2
+    return 0
+  fi
+  echo "$bytes" >"${ZFS_TEST_ROOT}/sys/module/zfs/parameters/zfs_arc_max" \
+    || echo "warning: the cap applies from the next reboot." >&2
+  info "ZFS memory cache capped at ${mib} MiB. Reserved Memory on the server's record must cover this plus the OS."
+}
+
+setup_zfs() {
+  local configured pool health service
+  local config="${ZFS_TEST_ROOT}${CONFIG_FILE}"
+  if [ -f "$config" ]; then
+    configured="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("zfs_parent", "-"))' "$config")" \
+      || die "could not read ${CONFIG_FILE}, so nothing changed."
+    [ -n "$configured" ] || die "this agent is installed without ZFS (zfs_parent is empty in ${CONFIG_FILE}), so nothing changed."
+    if [ "$configured" != "-" ]; then
+      if [ "$ZFS_PARENT_GIVEN" -eq 1 ] && [ "$ZFS_PARENT" != "$configured" ]; then
+        die "--zfs-parent ${ZFS_PARENT} differs from ${configured} in ${CONFIG_FILE}, so nothing changed."
+      fi
+      ZFS_PARENT="$configured"
+    fi
+  fi
+  python3 -c 'import re,sys; sys.exit(0 if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*(/[A-Za-z0-9_.-]+)+", sys.argv[1]) else 1)' "$ZFS_PARENT" \
+    || die "invalid ZFS dataset \"$ZFS_PARENT\": expected pool/dataset, such as tank/dms."
+  pool="${ZFS_PARENT%%/*}"
+
+  if ! command -v zpool >/dev/null 2>&1; then
+    info "Installing the ZFS tools"
+    { DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zfsutils-linux; } </dev/null \
+      || die "could not install zfsutils-linux."
+  fi
+
+  # Piped into bash, stdin is this script, so answers come from the terminal itself.
+  if ! ( : <"${ZFS_TEST_ROOT}/dev/tty" ) 2>/dev/null; then
+    die "the ZFS setup asks questions, so it needs a terminal. Run it from a console or SSH session."
+  fi
+  exec 3<"${ZFS_TEST_ROOT}/dev/tty" || die "could not open the terminal."
+
+  if zpool list -H -o name "$pool" >/dev/null 2>&1; then
+    info "Pool ${pool} already exists, so no disk was touched."
+  elif ! zfs_create_pool "$pool"; then
+    info "Stopped. Nothing changed."
+    return 0
+  fi
+  if ! zfs list -H -o name "$ZFS_PARENT" >/dev/null 2>&1; then
+    zfs create -p -o mountpoint=none "$ZFS_PARENT" || die "could not create ${ZFS_PARENT}."
+  fi
+
+  zfs_cap_memory
+
+  health="$(zpool list -H -o health "$pool")" || die "could not read the state of pool ${pool}."
+  [ "$health" = ONLINE ] || die "pool ${pool} is ${health}, not ONLINE. Check: zpool status ${pool}"
+  for service in zfs-import-cache zfs-mount; do
+    systemctl is-enabled --quiet "$service" \
+      || echo "warning: ${service} is not enabled, so the pool may not come back after a reboot." >&2
+  done
+  info "ZFS is ready: pool ${pool} is ONLINE with ${ZFS_PARENT}. The server form shows it within a minute."
+}
+
+if [ "$SETUP_ZFS" -eq 1 ]; then
+  [ "$WITH_ZFS" -eq 1 ] || die "--setup-zfs and --no-zfs cannot be used together."
+  [ -z "$TUNNEL_ACTION" ] || die "--setup-zfs cannot be combined with a tunnel step. Run them separately."
+  if [ -z "$CONTROL_URL" ]; then
+    ( setup_zfs ) || exit 1
+    exit 0
+  fi
+fi
+
 if [ -n "$TUNNEL_ACTION" ]; then
   [ -f "$CONFIG_FILE" ] || die "${CONFIG_FILE} not found. Install the agent first."
   case "$TUNNEL_ACTION" in
@@ -365,13 +636,14 @@ if [ -n "$TUNNEL_CREDENTIALS_FILE" ]; then
   install_tunnel || echo "warning: continuing; the server form shows when the tunnel comes up." >&2
 fi
 
+if [ "$SETUP_ZFS" -eq 1 ]; then
+  # A pool can be added later, so a problem here should not leave the agent uninstalled.
+  ( setup_zfs ) || echo "warning: the ZFS setup did not finish; the install continues." >&2
+fi
 if [ "$WITH_ZFS" -eq 1 ] && ! zfs list -H -o name "$ZFS_PARENT" >/dev/null 2>&1; then
   cat >&2 <<EOF
-warning: ZFS dataset "$ZFS_PARENT" does not exist yet.
-         Create the pool and dataset before provisioning anything, e.g.:
-           zpool create -o ashift=12 tank /dev/disk/by-id/<device>
-           zfs set compression=lz4 tank && zfs set atime=off tank
-           zfs create -o mountpoint=none tank/dms
+warning: ZFS dataset "$ZFS_PARENT" does not exist yet, and nothing can be provisioned until it does.
+         When the second disk is attached, run this installer again with only --setup-zfs.
 EOF
 fi
 
