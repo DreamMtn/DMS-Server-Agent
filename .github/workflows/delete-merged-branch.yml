@@ -1,0 +1,73 @@
+# Deletes a pull request's head branch once the PR is merged into `main`.
+# Merges into stage (or any other base) leave the branch alone, and
+# direct pushes or merges never trigger this workflow.
+name: Delete merged branch
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+env:
+  # Base branches whose merged PRs get their head branch deleted.
+  RELEASE_BASE_REGEX: '^main$'
+  # Head branches that are never deleted, whatever they were merged into:
+  # live/main/master, version branches (19, 19.0, 19-live) and stage
+  # branches (stage, stage-2026-11-01, 19-stage, 19-stage-2026-11-01).
+  # The standard for multi-version repos is NN-stage; NN.N-stage also works.
+  KEEP_BRANCH_REGEX: '^(live|main|master|stage([-_].+)?|[0-9]+(\.[0-9]+)?(-live|-stage([-_].+)?)?)$'
+
+jobs:
+  delete-branch:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete head branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$BASE" =~ $RELEASE_BASE_REGEX ]]; then
+            echo "Base '$BASE' is not a release branch. Keeping '$HEAD'."
+            exit 0
+          fi
+          if [[ "$HEAD" =~ $KEEP_BRANCH_REGEX || "$HEAD" == "$DEFAULT_BRANCH" || "$HEAD" =~ $RELEASE_BASE_REGEX ]]; then
+            echo "'$HEAD' is a long-lived branch. Not deleting it."
+            exit 0
+          fi
+
+          enc_head=$(jq -rn --arg v "$HEAD" '$v|@uri')
+
+          protected=$(gh api "repos/$REPO/branches/$enc_head" --jq '.protected' 2>/dev/null || echo "missing")
+          if [[ "$protected" == "missing" ]]; then
+            echo "'$HEAD' no longer exists. Nothing to do."
+            exit 0
+          fi
+          if [[ "$protected" == "true" ]]; then
+            echo "'$HEAD' is protected. Not deleting it."
+            exit 0
+          fi
+
+          # Deleting a branch closes every open PR that uses it, so keep it
+          # while another PR (for example one into stage) is still open.
+          owner="${REPO%%/*}"
+          others=$(gh api "repos/$REPO/pulls?state=open&head=$owner:$enc_head&per_page=100" \
+            --jq "[.[] | select(.number != $PR_NUMBER) | .number] | join(\", #\")")
+          if [[ -n "$others" ]]; then
+            echo "'$HEAD' is still the head of open PR #$others. Not deleting it."
+            exit 0
+          fi
+
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$enc_head"
+          echo "Deleted '$HEAD' after PR #$PR_NUMBER merged into '$BASE'."
