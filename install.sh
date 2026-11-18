@@ -5,9 +5,7 @@
 # published to the public installer repo (see installer/README.md). Customers run the
 # published copy:
 #
-#   curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/install.sh \
-#     | sudo bash -s -- --url https://control.example.com --token <enrollment token> \
-#         --release-key /tmp/release_key.pub.pem --version <version> --sha256 <digest>
+#   curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/install.sh -o /tmp/dms-install.sh && sudo bash /tmp/dms-install.sh --url https://control.example.com --token <enrollment token> --release-key /tmp/release_key.pub.pem --version <version> --sha256 <digest>
 #
 #   The host's enrollment dialog in the control plane prints this with every value filled in.
 #
@@ -539,6 +537,13 @@ setup_zfs() {
 
 if [ "$SETUP_ZFS" -eq 1 ]; then
   [ "$WITH_ZFS" -eq 1 ] || die "--setup-zfs and --no-zfs cannot be used together."
+  # Piped into sudo (curl ... | sudo bash), sudo's use_pty (the default on Ubuntu 24.04) does
+  # not pass the keyboard through while its stdin is the pipe: the questions show, the answers
+  # never arrive, and the script seems to hang. Checked before anything is installed.
+  if [ -n "${SUDO_USER:-}" ] && [ ! -t 0 ]; then
+    die "the ZFS setup asks questions, and piped into sudo your answers would never reach it. Nothing changed. Download the script and run it from the file with the same options:
+  curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/install.sh -o install.sh && sudo bash install.sh <the same options>"
+  fi
   [ -z "$TUNNEL_ACTION" ] || die "--setup-zfs cannot be combined with a tunnel step. Run them separately."
   if [ -z "$CONTROL_URL" ]; then
     ( setup_zfs ) || exit 1
