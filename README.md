@@ -16,20 +16,19 @@ contains a one-time **enrollment token** (valid one hour), plus the exact agent 
 install and that release's SHA-256 digest:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/keys/release_key.pub.pem \
-  -o /tmp/release_key.pub.pem
-curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/install.sh \
-  | sudo bash -s -- --url https://hosting-api.dreammtn.com --token <enrollment token> \
-                    --zfs-parent tank/dms --release-key /tmp/release_key.pub.pem \
-                    --version <version> --sha256 <digest>
+curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/keys/release_key.pub.pem -o /tmp/release_key.pub.pem && curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/install.sh -o /tmp/dms-install.sh && sudo bash /tmp/dms-install.sh --url https://hosting-api.dreammtn.com --token <enrollment token> --zfs-parent tank/dms --release-key /tmp/release_key.pub.pem --version <version> --sha256 <digest>
 ```
+
+The script is downloaded and then run from the file, not piped into `sudo bash`: piped, the
+ZFS setup questions never receive your answers (sudo's `use_pty`, the default on Ubuntu
+24.04), so the installer refuses them before installing anything.
 
 The installer has no "latest". It installs exactly the version it is given, and stops if
 the download does not match the digest.
 
 ### Verify before running it (recommended for production)
 
-That one-liner pipes a script from the internet into a root shell. For any host that matters,
+That command runs a script from the internet as root. For any host that matters,
 check it first. The expected digest and the release key fingerprint are shown in the
 enrollment dialog in the control plane, which is authenticated — this repository is not.
 
@@ -40,8 +39,7 @@ sha256sum /tmp/dms-install.sh          # compare with the enrollment dialog
 curl -fsSL https://raw.githubusercontent.com/DreamMtn/DMS-Server-Agent/main/keys/release_key.pub.pem \
   -o /tmp/release_key.pub.pem
 openssl pkey -pubin -in /tmp/release_key.pub.pem -outform DER | sha256sum   # key fingerprint
-sudo bash /tmp/dms-install.sh --url ... --token ... --release-key /tmp/release_key.pub.pem \
-                              --version ... --sha256 ...
+sudo bash /tmp/dms-install.sh --url ... --token ... --release-key /tmp/release_key.pub.pem --version ... --sha256 ...
 ```
 
 Compare the key fingerprint with the one in the enrollment dialog, not with anything on
